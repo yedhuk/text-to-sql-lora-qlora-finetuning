@@ -128,12 +128,26 @@ def main():
     result = trainer.train()
     wall_clock = time.time() - t0
 
-    peak_vram_gb = torch.cuda.max_memory_allocated() / 1e9
+    # Two "peak VRAM" numbers that can diverge a LOT for QLoRA:
+    #   allocated = live tensors PyTorch is tracking (what we logged before)
+    #   reserved  = the pool PyTorch claimed from the driver — this is the figure
+    #               nvtop shows and the one that actually triggers OOM.
+    # QLoRA's on-the-fly 4-bit dequant churns odd-sized blocks and fragments the
+    # caching allocator, so reserved can be ~2x allocated even when allocated looks
+    # identical to LoRA. Quote RESERVED to answer "will this fit?".
+    peak_alloc_gb = torch.cuda.max_memory_allocated() / 1e9
+    peak_resv_gb = torch.cuda.max_memory_reserved() / 1e9
+    print(f"[vram] peak allocated={peak_alloc_gb:.2f} GB | "
+          f"peak reserved={peak_resv_gb:.2f} GB  (reserved = nvtop / OOM figure)")
     m = result.metrics
     telemetry = {
         "mode": mode,
         "model_footprint_gb": round(model_footprint_gb, 3),
-        "peak_vram_gb": round(peak_vram_gb, 3),
+        # peak_vram_gb := reserved, so the comparison table reflects the real
+        # driver-level high-water mark (key name kept for orchestrator compat).
+        "peak_vram_gb": round(peak_resv_gb, 3),
+        "peak_vram_reserved_gb": round(peak_resv_gb, 3),
+        "peak_vram_allocated_gb": round(peak_alloc_gb, 3),
         "wall_clock_sec": round(wall_clock, 2),
         "train_runtime_sec": round(m.get("train_runtime", wall_clock), 2),
         "steps_per_second": round(m.get("train_steps_per_second", 0.0), 4),

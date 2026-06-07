@@ -47,8 +47,9 @@ def _load(path):
 # (key, label, source, fmt, delta) where source is 'tel' or 'ev',
 # fmt in {f2,f3,f4,int}, delta in {pct,abs,none}
 _METRICS = [
-    ("peak_vram_gb",        "Peak VRAM (GB)",        "tel", "f2", "pct"),
-    ("model_footprint_gb",  "Model footprint (GB)",  "tel", "f2", "pct"),
+    ("peak_vram_reserved_gb",  "Peak VRAM reserved (GB)",  "tel", "f2", "pct"),
+    ("peak_vram_allocated_gb", "Peak VRAM allocated (GB)", "tel", "f2", "pct"),
+    ("model_footprint_gb",     "Model footprint (GB)",     "tel", "f2", "pct"),
     ("steps_per_second",    "Train steps/sec",       "tel", "f3", "pct"),
     ("train_runtime_sec",   "Train runtime (s)",     "tel", "f2", "pct"),
     ("final_train_loss",    "Final train loss",      "tel", "f4", "abs"),
@@ -109,12 +110,29 @@ def interpret(data):
     el, eq = data["lora"]["ev"], data["qlora"]["ev"]
     if not all([tl, tq, el, eq]):
         return "Incomplete results — some JSON files were missing."
-    vram = (tq["peak_vram_gb"] - tl["peak_vram_gb"]) / tl["peak_vram_gb"] * 100
+
+    # Prefer the explicit reserved figure; fall back to peak_vram_gb for telemetry
+    # produced before reserved-memory logging was added.
+    def reserved(d):
+        return d.get("peak_vram_reserved_gb", d.get("peak_vram_gb"))
+
+    rl, rq = reserved(tl), reserved(tq)
+    al, aq = tl.get("peak_vram_allocated_gb"), tq.get("peak_vram_allocated_gb")
+    vram = (rq - rl) / rl * 100 if rl else 0.0
     speed = (tq["steps_per_second"] - tl["steps_per_second"]) / tl["steps_per_second"] * 100
     acc = (eq["exec_match_rate"] - el["exec_match_rate"]) * 100
+
+    alloc_note = ""
+    if al is not None and aq is not None:
+        alloc_note = (
+            f" — despite near-identical *allocated* VRAM ({al:.2f} vs {aq:.2f} GB); "
+            f"the gap is dequantization fragmentation in PyTorch's reserved pool, the "
+            f"figure that actually triggers OOM"
+        )
+
     return (
-        f"QLoRA used {abs(vram):.0f}% {'less' if vram < 0 else 'more'} peak VRAM "
-        f"({tl['peak_vram_gb']:.2f} -> {tq['peak_vram_gb']:.2f} GB), trained "
+        f"QLoRA used {abs(vram):.0f}% {'less' if vram < 0 else 'more'} peak RESERVED VRAM "
+        f"({rl:.2f} -> {rq:.2f} GB){alloc_note}. It trained "
         f"{abs(speed):.0f}% {'slower' if speed < 0 else 'faster'} "
         f"({tl['steps_per_second']:.2f} -> {tq['steps_per_second']:.2f} steps/sec), and its "
         f"exec-match rate changed by {acc:+.1f} points "

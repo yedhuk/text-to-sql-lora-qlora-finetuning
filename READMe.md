@@ -5,8 +5,32 @@ Fine-tune the same model **twice** — once with LoRA (16-bit base), once with Q
 and saves: peak VRAM, training speed, and SQL accuracy.
 
 The point of the project isn't to "win" — it's to produce an honest, reproducible
-side-by-side and understand *where* QLoRA's famous memory savings come from (and where
-they don't).
+side-by-side and understand *where* QLoRA's famous memory savings come from (and,
+just as importantly, where they don't). The headline result below is a good example:
+the obvious metric was misleading, and the truth only showed up once the *right*
+quantity was measured the *right* way.
+
+
+**LoRA Train Monitoring**
+<p>
+  <img src="https://raw.githubusercontent.com/yedhuk/text-to-sql-lora-qlora-finetuning/main/monitoring/lora_train.png" alt="lora_train_monitoring">
+</p>
+
+**LoRA Eval Monitoring**
+<p>
+  <img src="https://raw.githubusercontent.com/yedhuk/text-to-sql-lora-qlora-finetuning/main/monitoring/lora_eval.png" alt="lora_eval_monitoring">
+</p>
+
+**QLoRA Train Monitoring**
+<p>
+  <img src="https://raw.githubusercontent.com/yedhuk/text-to-sql-lora-qlora-finetuning/main/monitoring/qlora_train.png" alt="qlora_train_monitoring">
+</p>
+
+**QLoRA Eval Monitoring**
+<p>
+  <img src="https://raw.githubusercontent.com/yedhuk/text-to-sql-lora-qlora-finetuning/main/monitoring/qlora_eval.png" alt="qlora_eval_monitoring">
+</p>
+
 
 ## The task
 
@@ -52,8 +76,8 @@ precision differs, so any gap is attributable to quantization alone.
 
 ## Setup
 
-This was developed on an **RTX 5080 (Blackwell, `sm_120`)**, which requires recent CUDA
-kernels. Install `torch` from the CUDA 12.8 index **first**, then the rest:
+Developed on an **RTX 5080 (Blackwell, `sm_120`)**, which requires recent CUDA kernels.
+Install `torch` from the CUDA 12.8 index **first**, then the rest:
 
 ```bash
 python -m venv .venv && source .venv/bin/activate
@@ -95,9 +119,23 @@ python src/train.py lora    && python src/evaluate.py lora
 python src/train.py qlora   && python src/evaluate.py qlora
 ```
 
+### Monitoring
+
+`train.py` self-reports both `allocated` and `reserved` peak VRAM (see
+[Measurement notes](#measurement-notes-read-this)). To watch the GPU live in parallel,
+`nvtop` (per-process GPU detail) + `btop` (whole-system context) work well, or log a
+time series for later plotting:
+
+```bash
+nvidia-smi --query-gpu=timestamp,utilization.gpu,memory.used,power.draw,temperature.gpu,clocks.sm \
+           --format=csv -l 1 > gpu_log_lora.csv
+```
+
 ## Outputs (in `outputs/`)
 
-- `telemetry_{mode}.json` — peak VRAM, model footprint, steps/sec, runtime, final loss
+- `telemetry_{mode}.json` — speed + three memory figures:
+  `model_footprint_gb` (resident weights), `peak_vram_allocated_gb` (live tensors),
+  `peak_vram_reserved_gb` (the driver-visible pool that nvtop shows and that OOMs you)
 - `eval_{mode}.json` — accuracy summary + every one of the 100 examples (gold vs generated)
 - `eval_{mode}.md` — the same dump, readable, for eyeballing failures side by side
 - `benchmark_summary.{md,json}` — the LoRA-vs-QLoRA comparison table (the deliverable)
@@ -121,65 +159,102 @@ deterministic and re-runnable.
 
 ## Results (RTX 5080, 1.5B model, 2000 train / 100 test, 3 epochs)
 
-```
-Metric                   LoRA   QLoRA  Δ (QLoRA vs LoRA)
---------------------------------------------------------
-Peak VRAM (GB)           6.71    6.75              +0.7%
-Model footprint (GB)     3.11    1.64             -47.3%
-Train steps/sec         7.469   5.465             -26.8%
-Train runtime (s)      100.42  137.23             +36.7%
-Final train loss       0.0685  0.0676             -0.001
-Valid-SQL rate          0.990   0.990                 +0
-Exec-match rate         0.929   0.939             +0.010
-Hallucinations              0       1                 +1
-Syntax errors               1       0                 -1
-```
+| Metric | LoRA | QLoRA | Δ (QLoRA vs LoRA) |
+|---|---:|---:|---:|
+| Peak VRAM reserved (GB) | 15.06 | 15.03 | −0.2% |
+| Peak VRAM allocated (GB) | 6.71 | 6.75 | +0.7% |
+| Model footprint (GB) | 3.11 | 1.64 | **−47.3%** |
+| Train steps/sec | 7.527 | 5.300 | **−29.6%** |
+| Train runtime (s) | 99.64 | 141.51 | **+42.0%** |
+| Final train loss | 0.0685 | 0.0676 | −0.001 |
+| Valid-SQL rate | 0.990 | 0.990 | +0 |
+| Exec-match rate | 0.929 | 0.939 | +0.01 |
+| Hallucinations | 0 | 1 | +1 |
+| Syntax errors | 1 | 0 | −1 |
+| Gold-unexecutable (context) | 2 | 2 | — |
+
+Inference memory (from live monitoring during eval): **LoRA ≈ 3.5 GB, QLoRA ≈ 1.5 GB.**
 
 ### What it means
 
-**Quality is a tie.** The loss curves are nearly identical and both models produce valid,
+**Training memory: tied — and the cause is *not* quantization.** Both runs drove
+PyTorch's reserved pool to ~15 GB, while only ~6.7 GB of tensors were ever live
+(allocated) at any instant — in *both* runs. That ~8 GB gap between reserved and
+allocated is caching-allocator overhead, and it appears equally under LoRA and QLoRA.
+The likely driver is fragmentation: variable-length padded batches create
+constantly-changing activation tensor sizes, and with ~15 GB of free VRAM the allocator
+greedily grabs large segments and never releases them. None of that depends on 4-bit vs
+16-bit weights, so both runs land at the same ceiling. **QLoRA provided no peak-VRAM
+benefit during training at this scale.**
+
+**Quality: a tie.** Loss curves are nearly identical and both models produce valid,
 executable SQL ~99% of the time. The exec-match gap (1 example out of 98) and the
-hallucination/syntax differences (single examples) are noise, not real effects. A 4-bit
-base + 16-bit adapter learned this task just as well as a 16-bit base — the central QLoRA
-claim, reproduced.
+hallucination/syntax differences (single examples) are noise. A 4-bit base + 16-bit
+adapter learned this task just as well as a 16-bit base — the central QLoRA claim,
+reproduced.
 
-**Speed cost is real.** QLoRA trained ~27% slower. Its 4-bit weights are dequantized to
-bf16 on the fly for every matmul, and that overhead is exactly the price paid.
+**Speed: QLoRA's one real, robust cost.** QLoRA trained ~30% slower per step (+42%
+wall-clock). Its 4-bit weights are dequantized to bf16 on the fly for every matmul, and
+that overhead is exactly the price paid. This is the only large, unambiguous difference
+between the two runs.
 
-**The memory result is the interesting one.** QLoRA cut the *resident weight footprint*
-by 47% (3.11 → 1.64 GB) — but **peak training VRAM was unchanged** (6.71 → 6.75 GB).
-The reason: peak memory ≈ weights + activations (gradients/optimizer are negligible since
-the base is frozen). Quantization shrinks only the **weights**; **activations** —
-which depend on batch × sequence × layers, not weight precision — are untouched and here
-they dominate the peak. The ~1.5 GB saved on weights gets spent right back on
-dequantization scratch buffers. Net: a wash.
+**Where QLoRA actually wins** is *outside* the training peak: the static weight footprint
+(−47%, 3.11 → 1.64 GB) and **inference memory** (~1.5 vs ~3.5 GB at eval). Inference has
+no backward pass and runs at batch 1, so there's almost no allocator churn to drown the
+4-bit saving — the footprint advantage shows up cleanly. QLoRA's memory edge is
+fundamentally a *deployment/inference* property here, not a training one.
+
+### Measurement notes (read this)
+
+This benchmark's headline conclusion flipped **three times** depending on what was
+measured, and that's the most useful lesson in the whole project:
+
+1. `max_memory_allocated()` (live tensors) → "memory is a wash" (~6.7 GB both).
+2. A live `nvtop` **snapshot** mid-run → "QLoRA uses ~2×" (caught LoRA at a low instant).
+3. `max_memory_reserved()` **maxed over the full run** → "tied at ~15 GB; it's fragmentation."
+
+Only #3 answers "will this OOM?". A single live snapshot can miss the high-water mark
+entirely; `allocated` undercounts the driver-visible footprint. **Quote whole-run
+`reserved` for capacity planning, and always cross-check allocated vs reserved** — their
+divergence tells you whether you're weight-bound or allocator/fragmentation-bound.
 
 ### The takeaway
 
-> QLoRA shrinks the *static* cost (weights), never the *dynamic* cost (activations).
-> It pays off precisely when weights are the term about to break you — i.e. **large**
-> models, where resident weights dominate peak memory and a 4× cut is the difference
-> between OOM and fitting. At 1.5B on 16 GB, weights were a minority of peak, so we paid
-> the speed cost and saw essentially none of the memory benefit.
+> QLoRA shrinks the *static* cost (weights), never the *dynamic* cost
+> (activations + allocator behaviour). For **training** at 1.5B on a 16 GB card it was
+> pure downside — same peak memory, same accuracy, ~30% slower. Its real payoff is
+> (a) at **large scale**, where resident weights dominate peak memory and a 4× cut is the
+> difference between OOM and fitting, and (b) at **inference**, where the footprint
+> dominates and there's no backward-pass churn to mask it.
 
-This is *scale-dependent*: the exact same code on a 13B/70B model would show QLoRA
-preventing an OOM that LoRA cannot avoid.
+This is *scale-dependent*: the same code on a 13B/70B model would show QLoRA preventing an
+OOM that LoRA cannot avoid.
 
 ## Extending the experiment
 
-- **Make QLoRA earn its keep:** raise `PER_DEVICE_BATCH_SIZE` aggressively on the QLoRA
-  run only and watch LoRA OOM first. Run it as a *separate labeled* experiment — don't
-  edit the shared config, or the core A/B is no longer apples-to-apples.
+- **Unmask the hidden training benefit (do this first):** the ~15 GB ceiling is likely
+  fragmentation, not a hard requirement. Re-run with
+  `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True python run_benchmark.py --skip-data`.
+  If reserved drops toward ~7 GB (close to allocated) for both runs, fragmentation is
+  confirmed — and QLoRA's lower footprint should *then* translate into lower reserved,
+  giving it the training headroom that's currently masked.
+- **Make QLoRA earn its keep (do this second):** with fragmentation handled, raise
+  `PER_DEVICE_BATCH_SIZE` aggressively on the QLoRA run only and watch LoRA OOM first.
+  Run it as a *separate labeled* experiment — don't edit the shared config. (As-is, both
+  runs sit at ~15 GB, so a bigger batch would OOM both together — QLoRA has no headroom
+  edge until fragmentation is removed.)
 - **Activation memory lever:** flip `GRADIENT_CHECKPOINTING = True` (applied to both runs)
-  to see the activation term drop — at a compute cost. This is the orthogonal tool to
-  quantization.
-- **Bigger model:** swap `MODEL_NAME` for a 7B+ model to move into the
-  weights-dominate regime where the peak-VRAM gap becomes dramatic.
+  to attack the activation term directly, at a compute cost. Orthogonal to quantization.
+- **Bigger model:** swap `MODEL_NAME` for a 7B+ model to move into the weights-dominate
+  regime where the peak-VRAM gap becomes dramatic.
 
 ## Caveats
 
-- Synthetic-data evaluation makes the *absolute* accuracy a soft proxy (see above).
+- Synthetic-data evaluation makes the *absolute* accuracy a soft proxy (see above);
+  trust deltas and hallucination counts.
 - "Deterministic" greedy decoding holds on the same machine + library versions; tiny
   floating-point differences across GPUs can occasionally flip a near-tie token.
-- The benchmark trains on a 2000-row toy subset for speed; numbers are illustrative of
-  the *tradeoff shape*, not production accuracy.
+- The benchmark trains on a 2000-row toy subset for speed; numbers illustrate the
+  *tradeoff shape*, not production accuracy.
+- All numbers are tied to this GPU (16 GB) and model size (1.5B). Memory conclusions in
+  particular are scale-dependent; the speed and quality conclusions generalize better.
