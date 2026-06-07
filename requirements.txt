@@ -1,0 +1,29 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# This is tested on an RTX 5080 (Blackwell / sm_120). The Hugging Face libs are pinned
+# (the code in this repo is written against these exact versions). torch and
+# bitsandbytes are handled specially because Blackwell needs recent CUDA kernels.
+#
+# INSTALL ORDER (use a fresh venv):
+#   python -m venv .venv && source .venv/bin/activate
+#   pip install torch --index-url https://download.pytorch.org/whl/cu128
+#   pip install -r requirements.txt
+#
+# torch is intentionally NOT listed here — install it from the cu128 index FIRST
+# (line above). A plain `pip install torch` pulls a build without sm_120 kernels
+# and your 5080 silently won't accelerate (or errors out).
+# ─────────────────────────────────────────────────────────────────────────────
+
+transformers==4.46.3
+trl==0.12.2
+peft==0.13.2
+datasets==3.1.0
+accelerate==1.1.1
+pandas==2.2.3
+
+# 4-bit NF4 quantization (the "Q" in QLoRA). MUST be a Blackwell-aware build:
+# 0.44.x predates sm_120 kernels and will fail on the RTX 5080. Use 0.46.1+.
+# This is a FLOOR, not an exact pin, because Blackwell support is hardware-driven.
+# After install, record the resolved version for reproducibility:
+#   pip freeze | grep bitsandbytes
+# bitsandbytes>=0.46.1
+bitsandbytes==0.49.2
