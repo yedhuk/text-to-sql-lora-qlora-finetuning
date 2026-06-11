@@ -10,7 +10,6 @@ just as importantly, where they don't). The headline result below is a good exam
 the obvious metric was misleading, and the truth only showed up once the *right*
 quantity was measured the *right* way.
 
-
 **LoRA Train Monitoring**
 <p>
   <img src="https://raw.githubusercontent.com/yedhuk/text-to-sql-lora-qlora-finetuning/main/monitoring/lora_train.png" alt="lora_train_monitoring">
@@ -109,7 +108,8 @@ python run_benchmark.py
 
 Each stage runs as an **isolated subprocess** so one run's VRAM never leaks into the
 next run's measurement. Useful flags: `--skip-data` (reuse existing JSONL),
-`--report-only` (rebuild the table from existing result files without retraining).
+`--report-only` (rebuild the report from existing result files without retraining),
+`--baseline-only` (evaluate the un-tuned base model only, then report).
 
 Or run stages by hand:
 
@@ -117,6 +117,8 @@ Or run stages by hand:
 python data/prepare_data.py
 python src/train.py lora    && python src/evaluate.py lora
 python src/train.py qlora   && python src/evaluate.py qlora
+python src/evaluate.py base_strict     # baseline: raw template, no adapter
+python src/evaluate.py base_fair       # baseline: instruction prompt, no adapter
 ```
 
 ### Monitoring
@@ -136,9 +138,11 @@ nvidia-smi --query-gpu=timestamp,utilization.gpu,memory.used,power.draw,temperat
 - `telemetry_{mode}.json` — speed + three memory figures:
   `model_footprint_gb` (resident weights), `peak_vram_allocated_gb` (live tensors),
   `peak_vram_reserved_gb` (the driver-visible pool that nvtop shows and that OOMs you)
-- `eval_{mode}.json` — accuracy summary + every one of the 100 examples (gold vs generated)
+- `eval_{mode}.json` — accuracy summary + every one of the 100 examples (gold vs generated);
+  `mode` is `lora`, `qlora`, `base_strict`, or `base_fair`
 - `eval_{mode}.md` — the same dump, readable, for eyeballing failures side by side
-- `benchmark_summary.{md,json}` — the LoRA-vs-QLoRA comparison table (the deliverable)
+- `benchmark_summary.{md,json}` — the deliverable: the LoRA-vs-QLoRA training-cost table
+  **and** the accuracy table across all four configs (incl. the un-tuned baselines)
 
 ### How accuracy is measured
 
@@ -156,6 +160,13 @@ queries often return empty and "match" trivially — so the **absolute** exec-ma
 is a soft proxy. Trust the **LoRA-vs-QLoRA delta** and the hallucination counts more than
 the headline percentage. Generation is **greedy** (`do_sample=False`) so the eval is
 deterministic and re-runnable.
+
+**Baselines (controls).** The un-tuned base model is evaluated two ways, to separate
+*format-following* from *SQL capability*. `base_strict` feeds the exact raw template the
+tuned models use, so it measures the adapter's full value; `base_fair` uses a proper chat
+instruction ("reply with only one SQLite query") plus lenient extraction, so it measures
+what Qwen2.5 can already do when prompted well. The gap between them is how much of
+fine-tuning's value was simply teaching the output format.
 
 ## Results (RTX 5080, 1.5B model, 2000 train / 100 test, 3 epochs)
 
@@ -175,6 +186,15 @@ deterministic and re-runnable.
 
 Inference memory (from live monitoring during eval): **LoRA ≈ 3.5 GB, QLoRA ≈ 1.5 GB.**
 
+**Accuracy across all four configurations** (exec-match against the synthetic SQLite DBs):
+
+| Configuration | Valid-SQL | Exec-match | Hallucinations | Syntax errors |
+|---|---:|---:|---:|---:|
+| Base — strict template | 0.775 | 0.735 | 4 | 17 |
+| Base — instruction prompt | 0.969 | 0.918 | 2 | 1 |
+| LoRA fine-tuned | 0.990 | 0.929 | 0 | 1 |
+| QLoRA fine-tuned | 0.990 | 0.939 | 1 | 0 |
+
 ### What it means
 
 **Training memory: tied — and the cause is *not* quantization.** Both runs drove
@@ -192,6 +212,19 @@ executable SQL ~99% of the time. The exec-match gap (1 example out of 98) and th
 hallucination/syntax differences (single examples) are noise. A 4-bit base + 16-bit
 adapter learned this task just as well as a 16-bit base — the central QLoRA claim,
 reproduced.
+
+**Prompting was a bigger lever than fine-tuning.** This is the most striking result, and
+it only appears because of the baseline control. Switching the *base* model from the raw
+template to a proper instruction prompt lifted exec-match **+18 points** (0.735 → 0.918)
+and cut syntax errors from **17 to 1** — at zero training cost. Fine-tuning on top of a
+good prompt then added only ~+1 point (0.918 → 0.929), within noise on 98 examples. Read
+like-for-like, though, fine-tuning *is* real: a tuned model on the **bare** template
+(0.929) matches the base model given a **careful instruction** (0.918). So fine-tuning's
+genuine product here was **internalizing the prompt engineering** — the tuned models emit
+clean SQL from a minimal `[SQL]` cue with no instruction needed — plus a small reliability
+gain (valid-SQL 0.969 → 0.990). It did not teach new SQL reasoning the base model lacked.
+For an easy, synthetic dataset and a capable instruct model, that's expected — and a
+useful reminder to try better prompting before reaching for fine-tuning.
 
 **Speed: QLoRA's one real, robust cost.** QLoRA trained ~30% slower per step (+42%
 wall-clock). Its 4-bit weights are dequantized to bf16 on the fly for every matmul, and
@@ -229,6 +262,14 @@ divergence tells you whether you're weight-bound or allocator/fragmentation-boun
 
 This is *scale-dependent*: the same code on a 13B/70B model would show QLoRA preventing an
 OOM that LoRA cannot avoid.
+
+And on accuracy:
+
+> A good prompt got ~92%; fine-tuning got ~93%. For this task and model, **prompting was
+> the bigger lever** — fine-tuning's real value was making clean SQL automatic from a
+> minimal prompt, not adding capability. Try prompt engineering before fine-tuning; reach
+> for fine-tuning when you need format reliability, lower latency, shorter prompts, or
+> behaviour a prompt can't buy.
 
 ## Extending the experiment
 

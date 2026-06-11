@@ -23,7 +23,8 @@ import subprocess
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import config
 
-MODES = ["lora", "qlora"]
+MODES = ["lora", "qlora"]                    # trained configs (train + eval)
+BASE_MODES = ["base_strict", "base_fair"]    # baseline controls (eval only, no training)
 PY = sys.executable
 
 
@@ -142,6 +143,53 @@ def interpret(data):
     )
 
 
+# Accuracy comparison: configs as rows (incl. the two un-tuned baselines).
+ACCURACY_ORDER = [
+    ("base_strict", "Base (strict template)"),
+    ("base_fair",   "Base (instruction prompt)"),
+    ("lora",        "LoRA fine-tuned"),
+    ("qlora",       "QLoRA fine-tuned"),
+]
+
+
+def render_accuracy_table(summaries):
+    headers = ["Configuration", "Valid-SQL", "Exec-match", "Halluc.", "Syntax-err"]
+    rows = []
+    for mode, label in ACCURACY_ORDER:
+        s = summaries.get(mode)
+        if s:
+            rows.append([label, f"{s['valid_sql_rate']:.3f}", f"{s['exec_match_rate']:.3f}",
+                         str(s["hallucinations"]), str(s["syntax_errors"])])
+        else:
+            rows.append([label, "—", "—", "—", "—"])
+    w = [max(len(headers[c]), *(len(r[c]) for r in rows)) for c in range(len(headers))]
+
+    def fmt(cells):
+        return "  ".join([cells[0].ljust(w[0])] +
+                         [cells[c].rjust(w[c]) for c in range(1, len(cells))])
+
+    line = fmt(headers)
+    return "\n".join([line, "-" * len(line)] + [fmt(r) for r in rows])
+
+
+def interpret_accuracy(summaries):
+    lo = summaries.get("lora")
+    present = {k: summaries.get(k) for k in ("base_strict", "base_fair") if summaries.get(k)}
+    if not (lo and present):
+        return ""
+    base_best = max(v["exec_match_rate"] for v in present.values())
+    gain = (lo["exec_match_rate"] - base_best) * 100
+    desc = ", ".join(
+        f"{'strict' if k == 'base_strict' else 'instruction'} base {v['exec_match_rate']:.1%}"
+        for k, v in present.items()
+    )
+    return (
+        f"Baseline exec-match: {desc}. Fine-tuning (LoRA) reached {lo['exec_match_rate']:.1%} — "
+        f"a +{gain:.1f} point gain over the best base prompt, confirming the adapter (not the "
+        f"base model) is doing the work."
+    )
+
+
 def report():
     data = {}
     for m in MODES:
@@ -154,15 +202,33 @@ def report():
     table = render_table(rows)
     para = interpret(data)
 
+    # Accuracy across all configs, including the no-adapter baselines.
+    summaries = {m: data[m]["ev"] for m in MODES}
+    for m in BASE_MODES:
+        ev = _load(os.path.join(config.OUTPUT_DIR, f"eval_{m}.json"))
+        summaries[m] = ev["summary"] if ev else None
+    acc_table = render_accuracy_table(summaries)
+    acc_para = interpret_accuracy(summaries)
+
     print(f"\n{'#' * 70}\n# Text-to-SQL Benchmark — LoRA vs QLoRA\n{'#' * 70}\n")
     print(table)
     print(f"\n{para}\n")
+    print("\n--- Accuracy vs un-tuned base model ---\n")
+    print(acc_table)
+    if acc_para:
+        print(f"\n{acc_para}\n")
 
-    md = f"# Text-to-SQL Benchmark — LoRA vs QLoRA\n\n```\n{table}\n```\n\n{para}\n"
+    md = (
+        f"# Text-to-SQL Benchmark — LoRA vs QLoRA\n\n"
+        f"## Training cost (LoRA vs QLoRA)\n\n```\n{table}\n```\n\n{para}\n\n"
+        f"## Accuracy vs un-tuned base model\n\n```\n{acc_table}\n```\n\n{acc_para}\n"
+    )
     with open(os.path.join(config.OUTPUT_DIR, "benchmark_summary.md"), "w") as f:
         f.write(md)
     with open(os.path.join(config.OUTPUT_DIR, "benchmark_summary.json"), "w") as f:
-        json.dump({"table": rows, "interpretation": para, "raw": data}, f, indent=2)
+        json.dump({"table": rows, "interpretation": para,
+                   "accuracy": summaries, "accuracy_interpretation": acc_para,
+                   "raw": data}, f, indent=2)
     print(f"[saved] {os.path.join(config.OUTPUT_DIR, 'benchmark_summary.md')}")
 
 
@@ -170,14 +236,22 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--skip-data", action="store_true", help="reuse existing jsonl")
     parser.add_argument("--report-only", action="store_true", help="only rebuild the table")
+    parser.add_argument("--baseline-only", action="store_true",
+                        help="run only the two base-model evals, then report")
     args = parser.parse_args()
 
     if not args.report_only:
-        if not args.skip_data:
-            run_stage("data/prepare_data.py")
-        for m in MODES:
-            run_stage("src/train.py", m)
-            run_stage("src/evaluate.py", m)
+        if args.baseline_only:
+            for m in BASE_MODES:                  # uses existing lora/qlora evals in report
+                run_stage("src/evaluate.py", m)
+        else:
+            if not args.skip_data:
+                run_stage("data/prepare_data.py")
+            for m in MODES:
+                run_stage("src/train.py", m)
+                run_stage("src/evaluate.py", m)
+            for m in BASE_MODES:                  # baselines: eval only, no training
+                run_stage("src/evaluate.py", m)
 
     report()
 

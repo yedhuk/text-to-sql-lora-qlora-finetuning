@@ -134,10 +134,24 @@ def extract_sql(text: str) -> str:
 # ─────────────────────────────────────────────────────────────────────────────
 # MODEL (lazy heavy imports)
 # ─────────────────────────────────────────────────────────────────────────────
-def load_finetuned(mode: str):
+BASE_MODES = ("base_strict", "base_fair")  # raw base model, no adapter (the control)
+
+
+def load_model_for_eval(mode: str):
     import torch
     from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
     from peft import PeftModel
+
+    if mode in BASE_MODES:
+        # Raw base model, no adapter. bf16 — the natural "as shipped" baseline.
+        tok = AutoTokenizer.from_pretrained(config.MODEL_NAME)
+        if tok.pad_token is None:
+            tok.pad_token = "<|endoftext|>"
+        base = AutoModelForCausalLM.from_pretrained(
+            config.MODEL_NAME, torch_dtype=torch.bfloat16, device_map={"": 0}
+        )
+        base.eval()
+        return base, tok
 
     adapter_path = config.adapter_dir(mode)
     tok = AutoTokenizer.from_pretrained(adapter_path)
@@ -147,7 +161,7 @@ def load_finetuned(mode: str):
         base = AutoModelForCausalLM.from_pretrained(
             config.MODEL_NAME, torch_dtype=torch.bfloat16, device_map={"": 0}
         )
-    else:
+    else:  # qlora
         bnb = BitsAndBytesConfig(
             load_in_4bit=True, bnb_4bit_use_double_quant=True,
             bnb_4bit_quant_type="nf4", bnb_4bit_compute_dtype=torch.bfloat16,
@@ -161,27 +175,66 @@ def load_finetuned(mode: str):
     return model, tok
 
 
-def generate_sql(model, tok, context: str, question: str) -> str:
+_SQL_START = re.compile(r"(?is)\b(SELECT|WITH|INSERT|UPDATE|DELETE)\b")
+
+
+def extract_sql_freeform(text: str) -> str:
+    """Lenient extraction for the base model's chatty / possibly fenced output."""
+    text = text.replace("```sql", "```").replace("```SQL", "```")
+    if "```" in text:
+        parts = text.split("```")
+        if len(parts) >= 3:               # take the first fenced block
+            text = parts[1]
+    m = _SQL_START.search(text)           # jump to the first SQL keyword
+    if m:
+        text = text[m.start():]
+    text = text.strip()
+    if ";" in text:
+        return text[: text.index(";") + 1].strip()
+    return text.split("\n")[0].strip()
+
+
+# Instruction for the "fair" base prompt (the base model never saw our template).
+_BASE_FAIR_SYSTEM = (
+    "You are a SQLite expert. Given a table schema and a question, reply with ONLY "
+    "one valid SQLite query and nothing else — no explanation, no markdown fences."
+)
+
+
+def generate_sql(model, tok, context: str, question: str, mode: str) -> str:
     import torch
-    prompt = config.build_prompt(context, question)
-    # pt means pytorch tensors, return_tensors="pt" => get input_ids as a torch tensor
-    inputs = tok(prompt, return_tensors="pt").to(model.device)
+    if mode == "base_fair":
+        messages = [
+            {"role": "system", "content": _BASE_FAIR_SYSTEM},
+            {"role": "user", "content": f"Schema:\n{context}\n\nQuestion: {question}"},
+        ]
+        input_ids = tok.apply_chat_template(
+            messages, add_generation_prompt=True, return_tensors="pt"
+        )
+    else:
+        # lora / qlora / base_strict all use the raw training template.
+        prompt = config.build_prompt(context, question)
+        input_ids = tok(prompt, add_special_tokens=False, return_tensors="pt")["input_ids"]
+
+    input_ids = input_ids.to(model.device)
+    attn = torch.ones_like(input_ids)
     with torch.no_grad():
         out = model.generate(
-            **inputs,
+            input_ids=input_ids,
+            attention_mask=attn,
             max_new_tokens=config.MAX_NEW_TOKENS,
             do_sample=False,                 # greedy => deterministic eval
             pad_token_id=tok.pad_token_id,
         )
-    # The generated SQL is the part of the output that comes AFTER the prompt. We locate it by slicing off the input length from the total generated sequence. Then we decode that slice back into text and extract just the SQL portion using extract_sql().
-    gen_ids = out[0][inputs["input_ids"].shape[1]:]
-    return extract_sql(tok.decode(gen_ids, skip_special_tokens=True))
+    gen_ids = out[0][input_ids.shape[1]:]
+    text = tok.decode(gen_ids, skip_special_tokens=True)
+    return extract_sql_freeform(text) if mode == "base_fair" else extract_sql(text)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("mode", choices=["lora", "qlora"])
+    parser.add_argument("mode", choices=["lora", "qlora", "base_strict", "base_fair"])
     args = parser.parse_args()
     mode = args.mode
 
@@ -189,7 +242,7 @@ def main():
         test = [json.loads(line) for line in f]
     print(f"[eval] {len(test)} holdout examples | mode={mode}")
 
-    model, tok = load_finetuned(mode)
+    model, tok = load_model_for_eval(mode)
 
     records = []
     counts = {"exec_match": 0, "valid_sql": 0, "gold_ok": 0,
@@ -197,7 +250,7 @@ def main():
 
     for i, ex in enumerate(test):
         ctx, q, gold = ex["context"], ex["question"], ex["answer"]
-        gen = generate_sql(model, tok, ctx, q)
+        gen = generate_sql(model, tok, ctx, q, mode)
 
         rec = {"i": i, "question": q, "gold_sql": gold, "generated_sql": gen}
 
